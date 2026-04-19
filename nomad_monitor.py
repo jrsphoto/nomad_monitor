@@ -14,7 +14,25 @@ from urllib.error import URLError
 OLLAMA_API = "http://localhost:11434"
 PORT = 7070
 
-def get_gpu_stats():
+def detect_gpu():
+    # Returns 'nvidia', 'amd', or None
+    try:
+        r = subprocess.run(["nvidia-smi"], capture_output=True, timeout=3)
+        if r.returncode == 0:
+            return "nvidia"
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(["rocm-smi"], capture_output=True, timeout=3)
+        if r.returncode == 0:
+            return "amd"
+    except Exception:
+        pass
+    return None
+
+GPU_TYPE = detect_gpu()
+
+def get_gpu_stats_nvidia():
     try:
         result = subprocess.run([
             "nvidia-smi",
@@ -38,9 +56,100 @@ def get_gpu_stats():
             "power_limit": float(parts[7]),
             "clock_sm": float(parts[8]),
             "clock_mem": float(parts[9]),
+            "vendor": "nvidia",
         }
     except Exception as e:
         return {"error": str(e)}
+
+def get_gpu_stats_amd():
+    try:
+        # Get GPU name
+        name_result = subprocess.run(
+            ["rocm-smi", "--showproductname", "--csv"],
+            capture_output=True, text=True, timeout=5
+        )
+        name = "AMD GPU"
+        for line in name_result.stdout.splitlines():
+            if line.startswith("card") or (line and not line.startswith("device")):
+                parts = line.split(",")
+                if len(parts) >= 2:
+                    name = parts[1].strip()
+                    break
+
+        # Get all stats in one call
+        result = subprocess.run(
+            ["rocm-smi", "--showtemp", "--showuse", "--showmemuse",
+             "--showmeminfo", "vram", "--showpower", "--showclocks", "--csv"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            return {"error": "rocm-smi failed"}
+
+        temp = gpu_util = mem_util = mem_used = mem_total = power_draw = clock_sm = clock_mem = 0.0
+        power_limit = 300.0  # rocm-smi doesn't always expose power limit easily
+
+        for line in result.stdout.splitlines():
+            if not line or line.startswith("device") or line.startswith("=="):
+                continue
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 2:
+                continue
+            # rocm-smi CSV format varies by version, parse what we can
+            try:
+                # Temperature (Junction is closest to nvidia's gpu temp)
+                m = re.search(r'(\d+\.?\d*)', parts[1] if len(parts) > 1 else "")
+                if m and temp == 0.0:
+                    temp = float(m.group(1))
+            except Exception:
+                pass
+
+        # Use JSON output for more reliable parsing if available
+        json_result = subprocess.run(
+            ["rocm-smi", "--showtemp", "--showuse", "--showmemuse",
+             "--showmeminfo", "vram", "--showpower", "--showclocks", "--json"],
+            capture_output=True, text=True, timeout=5
+        )
+        if json_result.returncode == 0:
+            try:
+                data = json.loads(json_result.stdout)
+                # rocm-smi JSON uses card0, card1 etc as keys
+                card = next(iter(data.values()))
+                temp = float(card.get("Temperature (Sensor junction) (C)", 0))
+                gpu_util = float(card.get("GPU use (%)", 0))
+                mem_util = float(card.get("GPU memory use (%)", 0))
+                vram_used = card.get("VRAM Total Used Memory (B)", 0)
+                vram_total = card.get("VRAM Total Memory (B)", 0)
+                mem_used = round(float(vram_used) / 1024 / 1024, 1)
+                mem_total = round(float(vram_total) / 1024 / 1024, 1)
+                power_draw = float(card.get("Average Graphics Package Power (W)", 0))
+                clock_sm = float(card.get("sclk clock speed:", "0").replace("(", "").replace("Mhz)", "").strip() or 0)
+                clock_mem = float(card.get("mclk clock speed:", "0").replace("(", "").replace("Mhz)", "").strip() or 0)
+            except Exception:
+                pass
+
+        return {
+            "name": name,
+            "temp": temp,
+            "gpu_util": gpu_util,
+            "mem_util": mem_util,
+            "mem_used": mem_used,
+            "mem_total": mem_total,
+            "power_draw": power_draw,
+            "power_limit": power_limit,
+            "clock_sm": clock_sm,
+            "clock_mem": clock_mem,
+            "vendor": "amd",
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+def get_gpu_stats():
+    if GPU_TYPE == "nvidia":
+        return get_gpu_stats_nvidia()
+    elif GPU_TYPE == "amd":
+        return get_gpu_stats_amd()
+    else:
+        return {"error": "no supported GPU found (nvidia-smi or rocm-smi required)"}
 
 def get_cpu_stats():
     try:
@@ -376,4 +485,8 @@ if __name__ == '__main__':
     print("NOMAD Monitor running at http://0.0.0.0:" + str(PORT))
     print("Ctrl+C to stop")
     server = HTTPServer(('0.0.0.0', PORT), Handler)
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        server.server_close()
